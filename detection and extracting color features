@@ -1,0 +1,247 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.color import rgb2hsv, deltaE_ciede2000
+from scipy.stats import linregress
+from math import sqrt
+import pandas as pd
+import statsmodels.api as sm  # For R² and p-values
+
+# ---------------- Color Conversion Functions ----------------
+def convert_rgb_to_xyz_d65(rgb):
+    rgb = np.array(rgb) / 255.0
+    mask = rgb > 0.04045
+    rgb[mask] = ((rgb[mask] + 0.055) / 1.055) ** 2.4
+    rgb[~mask] = rgb[~mask] / 12.92
+
+    rgb_to_xyz_matrix = np.array([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ])
+    xyz = rgb_to_xyz_matrix @ rgb
+    return xyz
+
+def rgb_d65_to_lab_custom(rgb):
+    rgb = np.array(rgb) / 255.0
+    mask = rgb > 0.04045
+    rgb[mask] = ((rgb[mask] + 0.055) / 1.055) ** 2.4
+    rgb[~mask] = rgb[~mask] / 12.92
+
+    M = np.array([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ])
+    xyz = M @ rgb
+
+    white_src = np.array([0.95047, 1.00000, 1.08883])  # D65
+    white_dst = np.array([0.96422, 1.00000, 0.82521])  # D50
+
+    M_bradford = np.array([
+        [0.8951,  0.2664, -0.1614],
+        [-0.7502, 1.7135,  0.0367],
+        [0.0389, -0.0685,  1.0296]
+    ])
+    M_bradford_inv = np.linalg.inv(M_bradford)
+
+    LMS_src = M_bradford @ white_src
+    LMS_dst = M_bradford @ white_dst
+    D = np.diag(LMS_dst / LMS_src)
+    adapt_matrix = M_bradford_inv @ D @ M_bradford
+
+    xyz = adapt_matrix @ xyz
+    Xn, Yn, Zn = white_dst
+    x = xyz[0] / Xn
+    y = xyz[1] / Yn
+    z = xyz[2] / Zn
+
+    delta = 6 / 29
+    def f(t):
+        return np.where(t > delta**3, np.cbrt(t), (t / (3 * delta**2)) + 4/29)
+    f_xyz = f(np.array([x, y, z]))
+
+    L = 116 * f_xyz[1] - 16
+    a = 500 * (f_xyz[0] - f_xyz[1])
+    b = 200 * (f_xyz[1] - f_xyz[2])
+    return np.array([L, a, b])
+
+# ---------------- Circle Detection ----------------
+def detect_and_label_circles(image_path, min_area=1000, corner_margin=50, row_threshold=40):
+    image_bgr = cv2.imread(image_path)
+    if image_bgr is None:
+        print(f"Error: Could not load image {image_path}")
+        return None, None, None
+
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+
+    color_ranges = {
+        "Green": (np.array([35, 40, 40]), np.array([85, 255, 255])),
+        "Yellow": (np.array([15, 50, 50]), np.array([40, 255, 255])),
+        "Purple": (np.array([120, 30, 30]), np.array([160, 255, 255])),
+        "Light Blue": (np.array([90, 5, 80]), np.array([130, 255, 255]))
+    }
+
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in color_ranges.values():
+        mask |= cv2.inRange(hsv, lower, upper)
+
+    mask = cv2.GaussianBlur(mask, (3, 3), 0)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    detected_spots = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) > min_area:
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            if corner_margin < x < (image_rgb.shape[1] - corner_margin) and corner_margin < y < (image_rgb.shape[0] - corner_margin):
+                detected_spots.append((int(x), int(y), int(radius)))
+
+    if not detected_spots:
+        print("No valid circles detected.")
+        return None, None, None
+
+    detected_mask = np.zeros(image_rgb.shape[:2], dtype=np.uint8)
+    for (x, y, r) in detected_spots:
+        cv2.circle(detected_mask, (x, y), int(0.95 * r), 255, -1)
+    plt.figure(figsize=(6, 6))
+    plt.imshow(detected_mask, cmap='gray')
+    plt.axis('off')
+    plt.show()
+
+    spot_data = []
+    for (x, y, r) in detected_spots:
+        mask = np.zeros(image_rgb.shape[:2], dtype=np.uint8)
+        inner_radius = int(0.95 * r)
+        cv2.circle(mask, (x, y), inner_radius, 255, -1)
+        masked_rgb = cv2.bitwise_and(image_rgb, image_rgb, mask=mask)
+        pixels = masked_rgb[mask > 0]
+
+        mean_rgb = np.mean(pixels, axis=0)
+        mean_rgb_normalized = (pixels / 255.0).astype(np.float32)
+        mean_hsv = rgb2hsv(np.mean(mean_rgb_normalized, axis=0))
+        mean_hsv_cv = np.array([mean_hsv[0]*360, mean_hsv[1]*100, mean_hsv[2]*100])
+        mean_lab = tuple(map(float, rgb_d65_to_lab_custom(mean_rgb)))
+        mean_xyz = convert_rgb_to_xyz_d65(mean_rgb)
+        mean_gray = float(np.mean(0.299*pixels[:,0] + 0.587*pixels[:,1] + 0.114*pixels[:,2]))
+        spot_data.append((x, y, r, mean_rgb, mean_hsv_cv, mean_lab, mean_xyz, mean_gray))
+
+    sorted_spots = sorted(spot_data, key=lambda s: s[1])
+    groups = []
+    current_group = [sorted_spots[0]]
+    for i in range(1, len(sorted_spots)):
+        if abs(sorted_spots[i][1] - current_group[-1][1]) < row_threshold:
+            current_group.append(sorted_spots[i])
+        else:
+            groups.append(sorted(current_group, key=lambda s: s[0]))
+            current_group = [sorted_spots[i]]
+    groups.append(sorted(current_group, key=lambda s: s[0]))
+
+    final_labels = []
+    cmap = plt.get_cmap("tab10")
+    row_colors = {}
+    labels = ["B", "1", "2", "3", "4"]
+
+    for row_idx, group in enumerate(groups):
+        if len(group) < 3:
+            continue
+        row_colors[row_idx] = cmap(row_idx / len(groups))
+        for i, (x, y, r, rgb, hsv, lab, xyz, gray) in enumerate(group):
+            label = labels[i] if i < len(labels) else "?"
+            final_labels.append((x, y, r, label, rgb, hsv, lab, xyz, gray, row_idx))
+
+    b_lab_refs = {row_idx: lab for x, y, r, label, rgb, hsv, lab, xyz, gray, row_idx in final_labels if label=="B"}
+    updated_labels = []
+    for x, y, r, label, rgb, hsv, lab, xyz, gray, row_idx in final_labels:
+        delta_e = float(deltaE_ciede2000(np.array([[lab]]), np.array([[b_lab_refs[row_idx]]]))[0][0]) if label != "B" else 0.0
+        updated_labels.append((x, y, r, label, rgb, hsv, lab, xyz, gray, row_idx, delta_e))
+
+
+
+    return updated_labels, row_colors, image_rgb
+
+# ---------------- DataFrames ----------------
+def create_feature_dataframe_with_pval(final_labels):
+    if not final_labels:
+        print("No data available")
+        return None, None
+    label_to_conc = {'1': 2, '2': 4, '3': 6, '4': 8}
+    spot_data = []
+    for (_, _, _, label, rgb, hsv, lab, xyz, gray, row_idx, delta_e) in final_labels:
+        conc = label_to_conc.get(label, np.nan)
+        spot_data.append({
+            "Label": label, "Row": row_idx, "Concentration": conc,
+            "R": rgb[0], "G": rgb[1], "B": rgb[2],
+            "H": hsv[0], "S": hsv[1], "V": hsv[2],
+            "L*": lab[0], "A*": lab[1], "B*": lab[2],
+            "X": xyz[0], "Y": xyz[1], "Z": xyz[2],
+            "Gray": gray, "∆E": delta_e
+        })
+    df_spots = pd.DataFrame(spot_data)
+
+    feature_cols = ["R", "G", "B", "H", "S", "V", "L*", "A*", "B*", "X", "Y", "Z", "Gray", "∆E"]
+    stats_data = []
+    for feature in feature_cols:
+        valid_df = df_spots.dropna(subset=["Concentration", feature])
+        if len(valid_df) >= 2:
+            X = sm.add_constant(valid_df["Concentration"])
+            y = valid_df[feature]
+            model = sm.OLS(y, X).fit()
+            r_squared = model.rsquared
+            p_value = model.pvalues["Concentration"]
+        else:
+            r_squared, p_value = np.nan, np.nan
+        stats_data.append({"Feature": feature, "R_squared": r_squared, "p_value": p_value})
+
+    df_stats = pd.DataFrame(stats_data)
+    return df_spots, df_stats
+
+def print_feature_table(df_spots):
+    print("\n**Detected Spot Color Information**")
+    header = (f"| {'Label':^7} | {'R, G, B':^17} | {'H, S, V':^23} | "
+              f"{'L, a, b (LAB)':^21} | {'X, Y, Z':^25} | {'Gray':^8} | {'ΔE':^6} |")
+    print("-" * len(header))
+    print(header)
+    print("-" * len(header))
+    for _, row in df_spots.iterrows():
+        rgb_str = f"{int(row['R']):3d}, {int(row['G']):3d}, {int(row['B']):3d}"
+        hsv_str = f"{row['H']:6.2f}, {row['S']:6.2f}, {row['V']:6.2f}"
+        lab_str = f"{row['L*']:6.2f}, {row['A*']:6.2f}, {row['B*']:6.2f}"
+        xyz_str = f"{row['X']:6.2f}, {row['Y']:6.2f}, {row['Z']:6.2f}"
+        gray_str = f"{row['Gray']:6.2f}"
+        delta_str = f"{row['∆E']:6.2f}"
+        print(f"| {row['Label']:^7} | {rgb_str:^17} | {hsv_str:^23} | {lab_str:^21} | {xyz_str:^25} | {gray_str:^8} | {delta_str:^6} |")
+    print("-" * len(header))
+
+def print_r2_pval_table(df_stats):
+    print("\n**R² and p-values for Color Features**")
+    print("-" * 35)
+    print(f"| {'Feature':^12} | {'R²':^8} | {'p-value':^10} |")
+    print("-" * 35)
+    for _, row in df_stats.iterrows():
+        print(f"| {row['Feature']:^12} | {row['R_squared']:^8.4f} | {row['p_value']:^10.4e} |")
+    print("-" * 35)
+def plot_detected_circles(final_labels, image):
+    if final_labels is None:
+        print("No data to plot.")
+        return
+    image_copy = image.copy()
+    for (x, y, r, label, _, _, _, _, _, row_idx, _) in final_labels:
+        # Draw circle
+        cv2.circle(image_copy, (x, y), int(0.7*r), (255,0,0), 3)
+        # Put label slightly below and right of the circle
+        cv2.putText(image_copy, label, (x+5, y+5), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
+    plt.figure(figsize=(8,8))
+    plt.imshow(image_copy)
+    plt.axis('off')
+    plt.title("Detected and Labeled Circles")
+    plt.show()
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    final_labels, row_colors, image = detect_and_label_circles("/content/drive/MyDrive/dataset/img6.jpg")
+    df_spots, df_stats = create_feature_dataframe_with_pval(final_labels)
+    plot_detected_circles(final_labels, image)
+    print_feature_table(df_spots)
+    print_r2_pval_table(df_stats)
+
